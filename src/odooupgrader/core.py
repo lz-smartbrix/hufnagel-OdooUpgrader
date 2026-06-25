@@ -2,6 +2,7 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import zipfile
 import logging
@@ -20,12 +21,13 @@ class OdooUpgrader:
     VALID_VERSIONS = ["10.0", "11.0", "12.0", "13.0", "14.0", "15.0", "16.0", "17.0", "18.0", "19.0"]
 
     def __init__(self, source: str, target_version: str, extra_addons: Optional[str] = None, verbose: bool = False,
-                 postgres_version: str = "13"):
+                 postgres_version: str = "13", defer_extra_addons: bool = False):
         self.source = source
         self.target_version = target_version
         self.extra_addons = extra_addons
         self.verbose = verbose
         self.postgres_version = postgres_version
+        self.defer_extra_addons = defer_extra_addons
         self.cwd = os.getcwd()
         self.source_dir = os.path.join(self.cwd, 'source')
         self.output_dir = os.path.join(self.cwd, 'output')
@@ -277,10 +279,10 @@ class OdooUpgrader:
 
         console.print("[green]Custom addons prepared.[/green]")
 
-    def _get_custom_module_names(self) -> str:
-        """Scans the custom_addons_dir for valid Odoo modules and returns a comma-separated string."""
+    def _list_custom_modules(self) -> List[str]:
+        """Scans the custom_addons_dir for valid Odoo modules."""
         if not self.extra_addons or not os.path.exists(self.custom_addons_dir):
-            return ""
+            return []
 
         modules = []
         for item in os.listdir(self.custom_addons_dir):
@@ -289,10 +291,51 @@ class OdooUpgrader:
                 if (os.path.exists(os.path.join(item_path, '__manifest__.py')) or
                         os.path.exists(os.path.join(item_path, '__openerp__.py'))):
                     modules.append(item)
+        return modules
 
+    def _get_custom_module_names(self) -> str:
+        """Returns a comma-separated string of custom module names for --load."""
+        modules = self._list_custom_modules()
         if modules:
             return "," + ",".join(modules)
         return ""
+
+    def _defer_custom_modules(self):
+        """Marks custom modules as 'to install' so they are skipped during upgrade without data loss."""
+        modules = self._list_custom_modules()
+        if not modules:
+            return
+
+        names_sql = ",".join(f"'{name}'" for name in modules)
+        query = (
+            f"UPDATE ir_module_module SET state='to install' "
+            f"WHERE name IN ({names_sql}) "
+            f"AND state IN ('installed', 'to upgrade', 'to remove');"
+        )
+        cmd = ["docker", "exec", "-i", "db-odooupgrade", "psql", "-U", "odoo", "-d", "database", "-c", query]
+        self._run_cmd(cmd, check=False, capture_output=True)
+        console.print(
+            f"[yellow]Deferred custom modules (data preserved, reinstall after upgrade): "
+            f"{', '.join(modules)}[/yellow]"
+        )
+        logger.info(f"Deferred custom modules: {modules}")
+
+    def _get_update_modules_arg(self, exclude_modules: List[str]) -> str:
+        """Returns comma-separated module names to update, excluding deferred custom modules."""
+        if not exclude_modules:
+            return "all"
+
+        names_sql = ",".join(f"'{name}'" for name in exclude_modules)
+        query = (
+            f"SELECT name FROM ir_module_module "
+            f"WHERE state IN ('installed', 'to upgrade') "
+            f"AND name NOT IN ({names_sql}) "
+            f"ORDER BY name;"
+        )
+        cmd = ["docker", "exec", "-i", "db-odooupgrade", "psql", "-U", "odoo", "-d", "database", "-t", "-A", "-c", query]
+        res = self._run_cmd(cmd, check=False, capture_output=True)
+        modules = [line.strip() for line in res.stdout.splitlines() if line.strip()]
+        return ",".join(modules) if modules else "base"
 
     def process_source_file(self, filepath: str) -> str:
         """Extracts ZIP or prepares DUMP file."""
@@ -389,6 +432,8 @@ volumes:
                 except Exception as e:
                     logger.warning(f"Failed to copy filestore: {e}")
 
+            self._fix_filestore_permissions()
+
             self._run_cmd(["docker", "cp", dump_path, "db-odooupgrade:/tmp/dump.sql"])
             self._run_cmd(["docker", "exec", "-i", "db-odooupgrade", "psql", "-U", "odoo", "-d", "database", "-f",
                            "/tmp/dump.sql"], capture_output=True)
@@ -443,6 +488,65 @@ volumes:
             v = version.parse(current)
             return f"{v.major + 1}.0"
 
+    def _get_major_version(self, ver_str: str) -> int:
+        """Returns the major Odoo version number from a version string."""
+        return self.get_version_info(ver_str).major
+
+    def _image_tag_for_version(self, target_version: str) -> str:
+        """Returns a unique Docker image tag per upgrade step."""
+        return f"odoo-openupgrade-{target_version.replace('.', '-')}"
+
+    def _monitor_odoo_log(self, stop_event: threading.Event):
+        """Prints the latest odoo.log lines while an upgrade container is running."""
+        log_path = os.path.join(self.output_dir, "odoo.log")
+        last_pos = 0
+        last_printed = ""
+
+        while not stop_event.is_set():
+            if os.path.exists(log_path):
+                try:
+                    with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+                        f.seek(last_pos)
+                        new_content = f.read()
+                        if new_content:
+                            last_pos = f.tell()
+                            lines = [line.strip() for line in new_content.strip().split("\n") if line.strip()]
+                            if lines:
+                                latest = lines[-1]
+                                if latest != last_printed:
+                                    console.print(f"[dim]odoo.log:[/dim] {latest}")
+                                    last_printed = latest
+                except Exception:
+                    pass
+            stop_event.wait(20)
+
+    def _fix_filestore_permissions(self):
+        """Ensure the filestore bind mount is writable inside Docker (especially on Windows)."""
+        if not os.path.exists(self.filestore_dir):
+            return
+
+        if sys.platform != "win32":
+            try:
+                os.chmod(self.filestore_dir, 0o777)
+                for root, dirs, files in os.walk(self.filestore_dir):
+                    for d in dirs:
+                        os.chmod(os.path.join(root, d), 0o777)
+                    for f in files:
+                        os.chmod(os.path.join(root, f), 0o666)
+            except Exception as e:
+                logger.warning(f"Host-side filestore chmod failed: {e}")
+
+        filestore_abs = os.path.abspath(self.filestore_dir)
+        self._run_cmd(
+            [
+                "docker", "run", "--rm",
+                "-v", f"{filestore_abs}:/data",
+                "alpine:3",
+                "sh", "-c", "chmod -R 777 /data",
+            ],
+            check=False,
+        )
+
     def run_upgrade_step(self, target_version: str) -> bool:
         """Builds and runs the OpenUpgrade container."""
         logger.info(f"Preparing upgrade step to version {target_version}")
@@ -452,26 +556,41 @@ volumes:
         extra_addons_cmds = ""
         extra_addons_path_arg = ""
         custom_modules_load = ""
+        update_modules_arg = "all"
+        deferred_modules: List[str] = []
 
         if self.extra_addons:
-            # Force cache invalidation so COPY instructions run every time
-            with open(os.path.join(self.custom_addons_dir, ".build_timestamp"), "w") as f:
-                f.write(str(time.time()))
+            if is_final_step and self.defer_extra_addons:
+                deferred_modules = self._list_custom_modules()
+                self._defer_custom_modules()
+                update_modules_arg = self._get_update_modules_arg(deferred_modules)
+                logger.info(
+                    f"Skipping custom addons on final upgrade step (defer-extra-addons). "
+                    f"Updating {update_modules_arg.count(',') + 1} core modules."
+                )
+            else:
+                # Force cache invalidation so COPY instructions run every time
+                with open(os.path.join(self.custom_addons_dir, ".build_timestamp"), "w") as f:
+                    f.write(str(time.time()))
 
-            # Optimized Layering: Copy reqs first, then pip, then code
-            extra_addons_cmds = """
+                # Optimized Layering: Copy reqs first, then pip, then code
+                extra_addons_cmds = """
 RUN mkdir -p /mnt/custom-addons
 COPY --chown=odoo:odoo ./output/custom_addons/requirements.txt /mnt/custom-addons/requirements.txt
-RUN pip3 install --no-cache-dir -r /mnt/custom-addons/requirements.txt
+RUN if pip3 install --help | grep -q -- '--break-system-packages'; then \
+        pip3 install --break-system-packages --no-cache-dir -r /mnt/custom-addons/requirements.txt; \
+    else \
+        pip3 install --no-cache-dir -r /mnt/custom-addons/requirements.txt; \
+    fi
 COPY --chown=odoo:odoo ./output/custom_addons/ /mnt/custom-addons/
 """
 
-            if is_final_step:
-                logger.info("Target version reached. Injecting custom addons path and modules.")
-                extra_addons_path_arg = ",/mnt/custom-addons"
-                custom_modules_load = self._get_custom_module_names()
-            else:
-                logger.info("Intermediate version. Skipping custom addons loading.")
+                if is_final_step:
+                    logger.info("Target version reached. Injecting custom addons path and modules.")
+                    extra_addons_path_arg = ",/mnt/custom-addons"
+                    custom_modules_load = self._get_custom_module_names()
+                else:
+                    logger.info("Intermediate version. Skipping custom addons loading.")
 
         dockerfile_content = f"""
 FROM odoo:{target_version}
@@ -485,20 +604,23 @@ RUN if pip3 install --help | grep -q -- '--break-system-packages'; then \
     fi
 
 {extra_addons_cmds}
-
-USER odoo
 """
         with open("Dockerfile", "w", newline='\n') as f:
             f.write(dockerfile_content.strip())
 
+        self._fix_filestore_permissions()
+
+        image_tag = self._image_tag_for_version(target_version)
+
         compose_content = f"""
 services:
   odoo-openupgrade:
-    image: odoo-openupgrade
+    image: {image_tag}
     build:
       context: .
       dockerfile: Dockerfile
     container_name: odoo-openupgrade
+    user: "0:0"
     environment:
       - HOST=db-odooupgrade
       - POSTGRES_USER=odoo
@@ -514,7 +636,7 @@ services:
       odoo -d database
       --upgrade-path=/mnt/extra-addons/openupgrade_scripts/scripts
       --addons-path=/mnt/extra-addons{extra_addons_path_arg}
-      --update all
+      --update {update_modules_arg}
       --stop-after-init
       --load=base,web,openupgrade_framework{custom_modules_load}
       --log-level=info
@@ -531,6 +653,11 @@ networks:
 
         cmd_up = self.compose_cmd + ["-f", "odoo-upgrade-composer.yml", "up", "--build", "--abort-on-container-exit"]
 
+        log_stop = threading.Event()
+        log_monitor = threading.Thread(target=self._monitor_odoo_log, args=(log_stop,), daemon=True)
+        log_monitor.start()
+        compose_returncode = None
+
         with Progress(
                 SpinnerColumn(),
                 TextColumn("[progress.description]{task.description}"),
@@ -538,12 +665,16 @@ networks:
                 console=console
         ) as progress:
             task = progress.add_task(f"[bold magenta]Upgrading to {target_version}...", total=None)
+            console.print(
+                f"[dim]Monitor progress in {os.path.join(self.output_dir, 'odoo.log')} "
+                f"(large databases can take hours)[/dim]"
+            )
 
             try:
                 process = subprocess.Popen(
                     cmd_up,
                     stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
                     text=True,
                     bufsize=1,
                     universal_newlines=True
@@ -559,38 +690,40 @@ networks:
                             console.print(f"[dim]{line}[/dim]")
                         logger.debug(line)
 
-                stderr_output = process.stderr.read() if process.stderr else ""
-                if stderr_output:
-                    logger.error(f"Container Error Stream: {stderr_output}")
-
-                if process.returncode != 0:
+                compose_returncode = process.returncode
+                if compose_returncode != 0:
                     console.print("[bold red]Upgrade process failed.[/bold red]")
-                    logger.error("Upgrade process returned non-zero exit code.")
-                    if not self.verbose and stderr_output:
-                        console.print(stderr_output)
+                    logger.error(f"Upgrade process returned non-zero exit code: {compose_returncode}")
                     return False
 
             except Exception as e:
                 console.print(f"[bold red]Error running upgrade:[/bold red] {e}")
                 logger.error(f"Exception during upgrade subprocess: {e}")
                 return False
+            finally:
+                log_stop.set()
+                log_monitor.join(timeout=1)
 
         try:
-            res = self._run_cmd(["docker", "inspect", "odoo-openupgrade", "--format={{.State.ExitCode}}"],
-                                capture_output=True)
-            exit_code = int(res.stdout.strip())
-            logger.info(f"Container exit code: {exit_code}")
-
-            if exit_code == 0:
-                console.print(f"[green]Upgrade to {target_version} successful.[/green]")
-                self._run_cmd(self.compose_cmd + ["-f", "odoo-upgrade-composer.yml", "down"], check=False)
-                return True
+            res = self._run_cmd(
+                ["docker", "inspect", "odoo-openupgrade", "--format={{.State.ExitCode}}"],
+                check=False,
+                capture_output=True,
+            )
+            if res.returncode == 0:
+                exit_code = int(res.stdout.strip())
+                logger.info(f"Container exit code: {exit_code}")
+                if exit_code != 0:
+                    console.print(f"[bold red]Container exited with code {exit_code}[/bold red]")
+                    return False
             else:
-                console.print(f"[bold red]Container exited with code {exit_code}[/bold red]")
-                return False
+                logger.warning("Could not inspect container; trusting docker compose exit code.")
         except Exception as e:
-            logger.error(f"Error checking exit code: {e}")
-            return False
+            logger.warning(f"Error checking container exit code: {e}")
+
+        console.print(f"[green]Upgrade to {target_version} successful.[/green]")
+        self._run_cmd(self.compose_cmd + ["-f", "odoo-upgrade-composer.yml", "down"], check=False)
+        return True
 
     def finalize_package(self):
         """Dumps final database and zips it."""
@@ -694,12 +827,35 @@ networks:
                     break
                 else:
                     next_ver_str = self.generate_next_version(current_ver_str)
+                    console.print(
+                        f"[bold cyan]Starting upgrade step: "
+                        f"{current_ver_str} → {next_ver_str} (target: {self.target_version})[/bold cyan]"
+                    )
+                    logger.info(f"Upgrade step: {current_ver_str} -> {next_ver_str}")
+
+                    prev_major = self._get_major_version(current_ver_str)
 
                     if not self.run_upgrade_step(next_ver_str):
                         console.print("[bold red]Aborting sequence.[/bold red]")
                         sys.exit(1)
 
                     current_ver_str = self.get_current_version()
+                    if not current_ver_str:
+                        console.print("[bold red]Could not determine database version after upgrade.[/bold red]")
+                        logger.error("Could not determine database version after upgrade")
+                        sys.exit(1)
+
+                    new_major = self._get_major_version(current_ver_str)
+                    if new_major <= prev_major:
+                        console.print(
+                            f"[bold red]Upgrade to {next_ver_str} finished but database is still at "
+                            f"{current_ver_str}. Check {os.path.join(self.output_dir, 'odoo.log')} for errors.[/bold red]"
+                        )
+                        logger.error(
+                            f"Version stagnation: expected > {prev_major}, got {current_ver_str} (major {new_major})"
+                        )
+                        sys.exit(1)
+
                     console.print(f"[blue]Database is now at version: {current_ver_str}[/blue]")
 
         except KeyboardInterrupt:
