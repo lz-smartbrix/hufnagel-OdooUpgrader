@@ -40,17 +40,11 @@ logging.basicConfig(
     help="PostgreSQL version for the database container (default: 13)"
 )
 @click.option(
-    "--defer-extra-addons",
-    is_flag=True,
-    help="On the final upgrade step, defer custom modules (keeps their data) and skip loading them. "
-         "Use when custom addons are not yet compatible with the target version."
-)
-@click.option(
     "--log-file",
     type=click.Path(),
     help="Path to log file"
 )
-def main(source, version, extra_addons, verbose, postgres_version, defer_extra_addons, log_file):
+def main(source, version, extra_addons, verbose, postgres_version, log_file):
     """
     Odoo Database Upgrade Tool.
 
@@ -71,8 +65,7 @@ def main(source, version, extra_addons, verbose, postgres_version, defer_extra_a
         target_version=version,
         extra_addons=extra_addons,
         verbose=verbose,
-        postgres_version=postgres_version,
-        defer_extra_addons=defer_extra_addons,
+        postgres_version=postgres_version
     )
     upgrader.run()
 
